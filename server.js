@@ -6,6 +6,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- Hard kill-proofing (prevents container exit on random async errors)
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+// --- Config
 const PORT = Number(process.env.PORT || 8080);
 
 const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
@@ -17,30 +26,21 @@ const BASE_CONTRACT =
 const HYPEREVM_CONTRACT =
   (process.env.HYPEREVM_CONTRACT || "0x044A0B2D6eF67F5B82e51ec7229D84C0e83C8f02").toLowerCase();
 
-// Neynar optional (still fine if missing)
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY || "";
 
-// ------------ Providers (recreated on error) ------------
+// --- Providers (recreate on failure)
 let baseProvider = new ethers.JsonRpcProvider(BASE_RPC);
 let hyperProvider = new ethers.JsonRpcProvider(HYPEREVM_RPC);
 
-// Strike event signature topic0
+// Strike topic0
 const STRIKE_TOPIC0 = ethers.id("Strike(address,uint256,uint256)");
 
 // In-memory stats
 const stats = {
-  base: new Map(), // address -> { txCount, profile? }
-  hyperevm: new Map(),
+  base: new Map(),     // addr -> { txCount, profile }
+  hyperevm: new Map(), // addr -> { txCount, profile }
 };
 
-function bump(chain, address) {
-  const a = address.toLowerCase();
-  const cur = stats[chain].get(a) || { txCount: 0, profile: null };
-  cur.txCount += 1;
-  stats[chain].set(a, cur);
-}
-
-// (Optional) profile hydration for leaderboard (works without Neynar too)
 function fallbackProfile(addr) {
   return {
     username: "knight_" + addr.slice(2, 8),
@@ -54,15 +54,11 @@ async function fetchProfileByAddress(addr) {
   try {
     const url = `https://api.neynar.com/v2/farcaster/user/bulk-by-address?addresses=${addr}`;
     const res = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "x-api-key": NEYNAR_API_KEY,
-      },
+      headers: { accept: "application/json", "x-api-key": NEYNAR_API_KEY },
     });
-
     if (!res.ok) return fallbackProfile(addr);
-    const data = await res.json();
 
+    const data = await res.json();
     const user = data?.[addr]?.[0];
     if (!user) return fallbackProfile(addr);
 
@@ -70,7 +66,8 @@ async function fetchProfileByAddress(addr) {
       username: user.username || fallbackProfile(addr).username,
       pfpUrl: user.pfp_url || fallbackProfile(addr).pfpUrl,
     };
-  } catch {
+  } catch (e) {
+    console.error("neynar bulk-by-address error:", e?.message || e);
     return fallbackProfile(addr);
   }
 }
@@ -81,10 +78,7 @@ async function fetchUserByFid(fid) {
   try {
     const url = `https://api.neynar.com/v2/farcaster/user/bulk?fids=${fid}`;
     const res = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "x-api-key": NEYNAR_API_KEY,
-      },
+      headers: { accept: "application/json", "x-api-key": NEYNAR_API_KEY },
     });
     if (!res.ok) return null;
 
@@ -100,128 +94,109 @@ async function fetchUserByFid(fid) {
       pfpUrl: user.pfp_url,
       warpcastUrl: user.username ? `https://warpcast.com/${user.username}` : null,
     };
-  } catch {
+  } catch (e) {
+    console.error("neynar bulk-by-fid error:", e?.message || e);
     return null;
   }
 }
 
-// ------------ Resilient log polling ------------
-const POLL = {
-  base: {
-    chain: "base",
-    address: BASE_CONTRACT,
-    // bigger is fine on Base, but keep reasonable
-    chunkSize: 2000,
-    // start a bit back to catch recent strikes
-    lookback: 6000,
-    intervalMs: 5000,
-  },
-  hyperevm: {
-    chain: "hyperevm",
-    address: HYPEREVM_CONTRACT,
-    // HyperEVM nodes are picky -> keep chunks small
-    chunkSize: 400,
-    lookback: 12000,
-    intervalMs: 9000,
-  },
-};
-
-const cursors = {
-  base: { last: 0, head: 0, ok: true, lastError: "" },
-  hyperevm: { last: 0, head: 0, ok: true, lastError: "" },
-};
-
 function getProvider(chain) {
   return chain === "base" ? baseProvider : hyperProvider;
 }
-
 function resetProvider(chain) {
   if (chain === "base") baseProvider = new ethers.JsonRpcProvider(BASE_RPC);
   else hyperProvider = new ethers.JsonRpcProvider(HYPEREVM_RPC);
 }
 
+// Poll settings (HyperEVM: small chunks to avoid invalid range)
+const POLL = {
+  base: { address: BASE_CONTRACT, chunk: 2000, lookback: 8000, interval: 5000 },
+  hyperevm: { address: HYPEREVM_CONTRACT, chunk: 400, lookback: 20000, interval: 9000 },
+};
+
+const cursor = {
+  base: { last: 0, head: 0, ok: true, lastError: "", lastScan: "" },
+  hyperevm: { last: 0, head: 0, ok: true, lastError: "", lastScan: "" },
+};
+
 async function safeGetBlockNumber(chain) {
   try {
-    const p = getProvider(chain);
-    return await p.getBlockNumber();
+    return await getProvider(chain).getBlockNumber();
   } catch (e) {
-    cursors[chain].ok = false;
-    cursors[chain].lastError = `getBlockNumber failed: ${e?.message || e}`;
+    cursor[chain].ok = false;
+    cursor[chain].lastError = `getBlockNumber failed: ${e?.message || e}`;
     resetProvider(chain);
     return null;
   }
 }
 
 async function safeGetLogs(chain, fromBlock, toBlock) {
-  const p = getProvider(chain);
-
-  // never send invalid ranges
   if (fromBlock > toBlock) return [];
 
   try {
-    const logs = await p.getLogs({
+    const logs = await getProvider(chain).getLogs({
       address: POLL[chain].address,
       fromBlock,
       toBlock,
       topics: [STRIKE_TOPIC0],
     });
 
-    cursors[chain].ok = true;
-    cursors[chain].lastError = "";
+    cursor[chain].ok = true;
+    cursor[chain].lastError = "";
     return logs || [];
   } catch (e) {
-    // DO NOT advance cursor on errors
-    cursors[chain].ok = false;
-    cursors[chain].lastError = `getLogs failed: ${e?.message || e}`;
-
-    // If RPC is flaky, recreate provider and try again next tick
+    cursor[chain].ok = false;
+    cursor[chain].lastError = `getLogs failed: ${e?.message || e}`;
     resetProvider(chain);
-    return null;
+    return null; // signal failure
   }
+}
+
+function bump(chain, addr) {
+  const a = addr.toLowerCase();
+  const row = stats[chain].get(a) || { txCount: 0, profile: null };
+  row.txCount += 1;
+  stats[chain].set(a, row);
 }
 
 async function pollOnce(chain) {
   const cfg = POLL[chain];
 
-  // 1) find head
   const head = await safeGetBlockNumber(chain);
   if (head === null) return;
 
-  cursors[chain].head = head;
+  cursor[chain].head = head;
 
-  // 2) init cursor
-  if (cursors[chain].last === 0) {
-    cursors[chain].last = Math.max(0, head - cfg.lookback);
-    console.log(`[${chain}] initialized cursor at ${cursors[chain].last} (head=${head})`);
+  if (cursor[chain].last === 0) {
+    cursor[chain].last = Math.max(0, head - cfg.lookback);
+    console.log(`[${chain}] init cursor=${cursor[chain].last} head=${head}`);
     return;
   }
 
-  // 3) if cursor somehow got ahead of head, pull it back
-  if (cursors[chain].last > head) {
-    cursors[chain].last = Math.max(0, head - 1);
+  if (cursor[chain].last > head) {
+    cursor[chain].last = Math.max(0, head - 1);
   }
 
-  // 4) scan ONE chunk per tick (stable & avoids timeouts)
-  const from = cursors[chain].last + 1;
+  const from = cursor[chain].last + 1;
   if (from > head) return;
 
-  const to = Math.min(head, from + cfg.chunkSize);
-
+  const to = Math.min(head, from + cfg.chunk);
   const logs = await safeGetLogs(chain, from, to);
+
   if (logs === null) {
-    // failed -> do not advance cursor, try later
+    // IMPORTANT: do NOT advance cursor on failure
     return;
   }
 
-  // 5) decode minimal: topic[1] is indexed player address (right padded)
   for (const log of logs) {
-    // topics[1] = indexed address
     const topic1 = log.topics?.[1];
     if (!topic1) continue;
-    const addr = "0x" + topic1.slice(26); // last 40 hex chars
+
+    // indexed address is last 20 bytes of topic1
+    const addr = "0x" + topic1.slice(26);
     bump(chain, addr);
 
-    // hydrate profile once for leaderboard niceness
+    // hydrate profile once
     const row = stats[chain].get(addr.toLowerCase());
     if (row && !row.profile) {
       row.profile = await fetchProfileByAddress(addr.toLowerCase());
@@ -229,38 +204,37 @@ async function pollOnce(chain) {
     }
   }
 
-  // 6) advance cursor only after success
-  cursors[chain].last = to;
-
+  cursor[chain].last = to;
+  cursor[chain].lastScan = `${from}-${to} logs=${logs.length}`;
   console.log(`[${chain}] scanned ${from}-${to} logs=${logs.length} head=${head}`);
 }
 
 function startPolling() {
-  setInterval(() => pollOnce("base"), POLL.base.intervalMs);
-  setInterval(() => pollOnce("hyperevm"), POLL.hyperevm.intervalMs);
-
-  // kick once immediately
+  setInterval(() => pollOnce("base"), POLL.base.interval);
+  setInterval(() => pollOnce("hyperevm"), POLL.hyperevm.interval);
   pollOnce("base");
   pollOnce("hyperevm");
 }
 
-// ------------ Routes ------------
+// Routes
 app.get("/", (req, res) => res.status(200).send("ok"));
 
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     port: PORT,
-    base: cursors.base,
-    hyperevm: cursors.hyperevm,
+    baseContract: BASE_CONTRACT,
+    hyperevmContract: HYPEREVM_CONTRACT,
+    base: cursor.base,
+    hyperevm: cursor.hyperevm,
     basePlayers: stats.base.size,
     hyperevmPlayers: stats.hyperevm.size,
   });
 });
 
 app.get("/api/leaderboard/:chain", (req, res) => {
-  const key = req.params.chain === "base" ? "base" : "hyperevm";
-  const list = Array.from(stats[key].entries())
+  const chain = req.params.chain === "base" ? "base" : "hyperevm";
+  const list = Array.from(stats[chain].entries())
     .map(([address, data]) => ({
       address,
       username: data.profile?.username || fallbackProfile(address).username,
@@ -275,17 +249,17 @@ app.get("/api/leaderboard/:chain", (req, res) => {
 });
 
 app.get("/api/profile/:address", (req, res) => {
-  const address = (req.params.address || "").toLowerCase();
-  const baseRow = stats.base.get(address);
-  const hyperRow = stats.hyperevm.get(address);
+  const addr = (req.params.address || "").toLowerCase();
+  const b = stats.base.get(addr);
+  const h = stats.hyperevm.get(addr);
 
-  const profile = baseRow?.profile || hyperRow?.profile || fallbackProfile(address);
+  const profile = b?.profile || h?.profile || fallbackProfile(addr);
 
   res.json({
     ...profile,
     txCount: {
-      base: baseRow?.txCount || 0,
-      hyperevm: hyperRow?.txCount || 0,
+      base: b?.txCount || 0,
+      hyperevm: h?.txCount || 0,
     },
   });
 });
