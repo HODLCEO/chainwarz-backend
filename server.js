@@ -1,454 +1,425 @@
-// server.js
-const express = require("express");
-const cors = require("cors");
-const { ethers } = require("ethers");
+// server.js (ESM) — ChainWarZ backend
+import express from "express";
+import cors from "cors";
+import { ethers } from "ethers";
 
-// Node 18+ has global fetch. If your runtime is older, you must add node-fetch.
-// Railway Node is usually 18+.
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
 
-// --- RPCs (use your working ones) ---
+// --- RPCs / Contracts ---
 const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
 const HYPEREVM_RPC = process.env.HYPEREVM_RPC || "https://rpc.hyperliquid.xyz/evm";
 
-// --- Contracts ---
 const BASE_CONTRACT =
   process.env.BASE_CONTRACT || "0xB2B23e69b9d811D3D43AD473f90A171D18b19aab";
+
 const HYPEREVM_CONTRACT =
   process.env.HYPEREVM_CONTRACT || "0x044A0B2D6eF67F5B82e51ec7229D84C0e83C8f02";
 
+// Strike event topic (your logs show this is the event being indexed)
+const STRIKE_TOPIC = ethers.id("Strike(address)");
+
 // --- Neynar ---
-const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY; // DO NOT hardcode in production
-if (!NEYNAR_API_KEY) {
-  console.warn("⚠️ NEYNAR_API_KEY is missing. Farcaster profiles will not resolve.");
+const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY || "";
+const NEYNAR_BASE = "https://api.neynar.com/v2/farcaster";
+
+function assertNeynar() {
+  if (!NEYNAR_API_KEY) {
+    throw new Error("Missing NEYNAR_API_KEY env var");
+  }
 }
 
-const CONTRACT_ABI = ["event Strike(address indexed player, uint256 amount, uint256 timestamp)"];
+async function neynarGet(path, params = {}) {
+  assertNeynar();
+  const u = new URL(`${NEYNAR_BASE}${path}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    u.searchParams.set(k, String(v));
+  }
+  const res = await fetch(u.toString(), {
+    headers: { "x-api-key": NEYNAR_API_KEY },
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Neynar ${res.status}: ${t || res.statusText}`);
+  }
+  return res.json();
+}
 
-const baseProvider = new ethers.JsonRpcProvider(BASE_RPC);
-const hyperevmProvider = new ethers.JsonRpcProvider(HYPEREVM_RPC);
+// Simple in-memory cache
+const cache = new Map();
+function cacheGet(key) {
+  const v = cache.get(key);
+  if (!v) return null;
+  if (Date.now() > v.exp) {
+    cache.delete(key);
+    return null;
+  }
+  return v.val;
+}
+function cacheSet(key, val, ttlMs = 5 * 60 * 1000) {
+  cache.set(key, { val, exp: Date.now() + ttlMs });
+}
 
-const baseContract = new ethers.Contract(BASE_CONTRACT, CONTRACT_ABI, baseProvider);
-const hyperevmContract = new ethers.Contract(HYPEREVM_CONTRACT, CONTRACT_ABI, hyperevmProvider);
+// --- Chain polling state ---
+const providers = {
+  base: new ethers.JsonRpcProvider(BASE_RPC),
+  hyperevm: new ethers.JsonRpcProvider(HYPEREVM_RPC),
+};
 
-// Store per-address strike counts (raw)
-const playerStats = {
-  base: new Map(), // address -> { txCount, profile? }
+const contracts = {
+  base: ethers.getAddress(BASE_CONTRACT),
+  hyperevm: ethers.getAddress(HYPEREVM_CONTRACT),
+};
+
+// txCounts[chain][addressLower] = count
+const txCounts = {
+  base: new Map(),
   hyperevm: new Map(),
 };
 
-// Cache address->user profile lookups (so we don’t spam Neynar)
-const addressProfileCache = new Map(); // lowerAddress -> { fid, username, displayName, pfpUrl, bio, custodyAddress, verifications }
-const fidProfileCache = new Map(); // fid -> { fid, username, displayName, pfpUrl, bio, custodyAddress, verifications }
+const poll = {
+  base: { last: 0, head: 0, ok: false, lastError: "", lastScan: "" },
+  hyperevm: { last: 0, head: 0, ok: false, lastError: "", lastScan: "" },
+};
 
-// ------------------------
-// Neynar helpers
-// ------------------------
+// Helpers
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function normalizeUserFromNeynar(u) {
-  if (!u) return null;
+function incCount(chainKey, addrLower) {
+  const m = txCounts[chainKey];
+  m.set(addrLower, (m.get(addrLower) || 0) + 1);
+}
 
-  // Neynar returns fields like:
-  // username, display_name, pfp_url, profile.bio.text, custody_address, verifications
-  const username = u.username || null;
-  const displayName = u.display_name || u.displayName || null;
-  const pfpUrl = u.pfp_url || u.pfpUrl || null;
-  const bio = u.profile?.bio?.text || u.bio || "";
-  const fid = u.fid ?? null;
-  const custodyAddress = (u.custody_address || u.custodyAddress || "").toLowerCase() || null;
+function parseIndexedAddress(topic1) {
+  // topic is 32-byte hex, last 20 bytes are address
+  return ("0x" + topic1.slice(26)).toLowerCase();
+}
 
-  // verifications is typically an array of eth addresses (may include sol too depending endpoint)
-  const verifications = Array.isArray(u.verifications)
-    ? u.verifications.map((a) => String(a).toLowerCase())
+function uniqLower(addrs) {
+  const s = new Set();
+  for (const a of addrs) if (a) s.add(a.toLowerCase());
+  return [...s];
+}
+
+// --- Neynar user by fid (bulk) ---
+// Docs: /v2/farcaster/user/bulk?fids=... :contentReference[oaicite:1]{index=1}
+async function getUserByFid(fid) {
+  const key = `fid:${fid}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const data = await neynarGet("/user/bulk", { fids: fid });
+  const user = Array.isArray(data?.users) ? data.users[0] : null;
+
+  cacheSet(key, user || null);
+  return user || null;
+}
+
+function userToIdentity(user) {
+  if (!user) return null;
+  const username = user.username || "";
+  const displayName = user.display_name || user.displayName || username;
+  const pfpUrl = user.pfp_url || user.pfpUrl || "";
+  const bio =
+    user?.profile?.bio?.text ||
+    user?.profile?.bio ||
+    user?.bio ||
+    "";
+  const warpcastUrl = username ? `https://warpcast.com/${username}` : null;
+
+  const custodyAddress = (user.custody_address || "").toLowerCase();
+  const verifications = Array.isArray(user.verifications)
+    ? user.verifications.map((a) => String(a).toLowerCase())
     : [];
 
+  const wallets = uniqLower([custodyAddress, ...verifications]);
+
   return {
-    fid,
+    fid: user.fid,
     username,
     displayName,
     pfpUrl,
     bio,
-    custodyAddress,
-    verifications,
-    warpcastUrl: username ? `https://warpcast.com/${username}` : null,
+    warpcastUrl,
+    custodyAddress: custodyAddress || null,
+    wallets,
   };
 }
 
-async function fetchUserByFid(fid) {
-  if (!NEYNAR_API_KEY) return null;
-  if (!fid) return null;
+// --- Address → Farcaster users (bulk-by-address) ---
+// Docs: /v2/farcaster/user/bulk-by-address?addresses=... :contentReference[oaicite:2]{index=2}
+async function bulkByAddress(addresses, address_types) {
+  if (!addresses.length) return {};
+  const key = `bulkaddr:${address_types}:${addresses.join(",")}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
 
-  if (fidProfileCache.has(fid)) return fidProfileCache.get(fid);
+  const data = await neynarGet("/user/bulk-by-address", {
+    addresses: addresses.join(","),
+    address_types, // "custody_address" or "verified_address"
+    chain: "ethereum",
+  });
 
-  try {
-    // Neynar: Fetch bulk users by fids (comma-separated)
-    // Docs: https://docs.neynar.com/reference/fetch-bulk-users
-    const url = `https://api.neynar.com/v2/farcaster/user/bulk?fids=${encodeURIComponent(
-      String(fid)
-    )}`;
+  // Response is an object keyed by address, value is array of users :contentReference[oaicite:3]{index=3}
+  cacheSet(key, data, 2 * 60 * 1000);
+  return data || {};
+}
 
-    const resp = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "x-api-key": NEYNAR_API_KEY,
-      },
-    });
+function pickUniqueUser(usersArray) {
+  // Neynar warns verified addresses can map to multiple users :contentReference[oaicite:4]{index=4}
+  if (!Array.isArray(usersArray)) return null;
+  if (usersArray.length !== 1) return null;
+  return usersArray[0];
+}
 
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const user = data?.users?.[0];
-    const normalized = normalizeUserFromNeynar(user);
+// Safe resolver: custody first, then verified-only-if-unique
+async function resolveAddressesToIdentity(addressesLower) {
+  const result = new Map(); // addrLower -> identity
 
-    if (normalized) {
-      fidProfileCache.set(fid, normalized);
-
-      // Also backfill address cache for custody + verifications
-      if (normalized.custodyAddress) addressProfileCache.set(normalized.custodyAddress, normalized);
-      for (const v of normalized.verifications || []) addressProfileCache.set(v, normalized);
-    }
-
-    return normalized;
-  } catch (e) {
-    console.error("fetchUserByFid error:", e?.message || e);
-    return null;
+  // 1) custody_address mapping
+  const custodyResp = await bulkByAddress(addressesLower, "custody_address");
+  for (const [addr, users] of Object.entries(custodyResp || {})) {
+    const u = pickUniqueUser(users);
+    if (u) result.set(addr.toLowerCase(), userToIdentity(u));
   }
-}
 
-async function fetchUsersByAddress(address) {
-  if (!NEYNAR_API_KEY) return null;
-  if (!address) return null;
-
-  const a = String(address).toLowerCase();
-  if (addressProfileCache.has(a)) return addressProfileCache.get(a);
-
-  try {
-    // Neynar: Fetch bulk users by address
-    // Docs: https://docs.neynar.com/reference/fetch-bulk-users-by-eth-or-sol-address
-    const url = `https://api.neynar.com/v2/farcaster/user/bulk-by-address?addresses=${encodeURIComponent(
-      a
-    )}`;
-
-    const resp = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "x-api-key": NEYNAR_API_KEY,
-      },
-    });
-
-    if (!resp.ok) return null;
-
-    const data = await resp.json();
-
-    // This endpoint returns a "users" list OR a mapping depending on version;
-    // we safely handle either.
-    const usersList = Array.isArray(data?.users)
-      ? data.users
-      : Array.isArray(data?.[a])
-      ? data[a]
-      : [];
-
-    const best = usersList?.[0] || null;
-    const normalized = normalizeUserFromNeynar(best);
-
-    if (normalized) {
-      addressProfileCache.set(a, normalized);
-      fidProfileCache.set(normalized.fid, normalized);
+  // 2) verified_address mapping (only fill missing; only unique)
+  const missing = addressesLower.filter((a) => !result.has(a));
+  if (missing.length) {
+    const verifiedResp = await bulkByAddress(missing, "verified_address");
+    for (const [addr, users] of Object.entries(verifiedResp || {})) {
+      const u = pickUniqueUser(users);
+      if (u) result.set(addr.toLowerCase(), userToIdentity(u));
     }
-
-    return normalized;
-  } catch (e) {
-    console.error("fetchUsersByAddress error:", e?.message || e);
-    return null;
   }
+
+  return result;
 }
 
-function fallbackProfileForAddress(address) {
-  const a = String(address).toLowerCase();
-  return {
-    fid: null,
-    username: `knight_${a.slice(2, 8)}`,
-    displayName: "Knight",
-    pfpUrl: `https://api.dicebear.com/7.x/avataaars/svg?seed=${a}`,
-    bio: "Chain warrior",
-    custodyAddress: null,
-    verifications: [],
-    warpcastUrl: null,
-  };
-}
+// --- Leaderboard builder ---
+async function buildLeaderboard(chainKey) {
+  const entries = [...txCounts[chainKey].entries()].map(([address, txCount]) => ({
+    address,
+    txCount,
+  }));
+  entries.sort((a, b) => b.txCount - a.txCount);
 
-// ------------------------
-// Polling (simple & stable)
-// ------------------------
+  const top = entries.slice(0, 250);
+  const addresses = top.map((x) => x.address.toLowerCase());
 
-let lastBaseBlock = 0;
-let lastHyperBlock = 0;
-
-// These “scan windows” prevent RPC errors like “invalid block range” / “max block range”
-const MAX_BLOCKS_PER_QUERY_BASE = 1500;
-const MAX_BLOCKS_PER_QUERY_HYPER = 800; // hyper RPCs are often stricter
-
-async function pollChain({
-  chainKey,
-  provider,
-  contract,
-  lastBlockRef,
-  setLastBlockRef,
-  maxRange,
-}) {
+  let addrToIdent = new Map();
   try {
-    const head = await provider.getBlockNumber();
-
-    if (!lastBlockRef.value) {
-      // start near head, so we don't query giant historical ranges
-      lastBlockRef.value = Math.max(0, head - 500);
-      console.log(`[${chainKey}] polling from block ${lastBlockRef.value}`);
+    // Don’t crash leaderboard if Neynar is temporarily down/rate-limited
+    if (NEYNAR_API_KEY) {
+      addrToIdent = await resolveAddressesToIdentity(addresses);
     }
+  } catch {
+    addrToIdent = new Map();
+  }
 
-    if (head <= lastBlockRef.value) return;
+  // Merge by FID
+  const byFid = new Map(); // fid -> row
+  const anon = [];
 
-    // scan in chunks
-    let from = lastBlockRef.value + 1;
-    while (from <= head) {
-      const to = Math.min(head, from + maxRange);
+  for (const row of top) {
+    const ident = addrToIdent.get(row.address.toLowerCase()) || null;
 
-      const events = await contract.queryFilter("Strike", from, to);
-
-      for (const ev of events) {
-        const addr = String(ev.args.player).toLowerCase();
-        const map = chainKey === "base" ? playerStats.base : playerStats.hyperevm;
-
-        const current = map.get(addr) || { txCount: 0, profile: null };
-        current.txCount += 1;
-
-        // lazy profile lookup
-        if (!current.profile) {
-          const p = (await fetchUsersByAddress(addr)) || fallbackProfileForAddress(addr);
-          current.profile = p;
-        }
-
-        map.set(addr, current);
+    if (ident?.fid) {
+      const fid = ident.fid;
+      if (!byFid.has(fid)) {
+        byFid.set(fid, {
+          fid,
+          username: ident.username,
+          displayName: ident.displayName,
+          pfpUrl: ident.pfpUrl,
+          walletCount: 0,
+          txCount: 0,
+          // NOTE: we do NOT return a "random address" anymore for Farcaster rows.
+        });
       }
-
-      lastBlockRef.value = to;
-      setLastBlockRef(lastBlockRef.value);
-
-      from = to + 1;
-    }
-  } catch (e) {
-    const msg = e?.shortMessage || e?.message || String(e);
-    console.error(`[${chainKey}] poll error:`, msg);
-  }
-}
-
-const lastBaseBlockRef = { value: 0 };
-const lastHyperBlockRef = { value: 0 };
-
-function startPolling() {
-  setInterval(() => {
-    pollChain({
-      chainKey: "base",
-      provider: baseProvider,
-      contract: baseContract,
-      lastBlockRef: lastBaseBlockRef,
-      setLastBlockRef: (v) => (lastBaseBlock = v),
-      maxRange: MAX_BLOCKS_PER_QUERY_BASE,
-    });
-  }, 5000);
-
-  setInterval(() => {
-    pollChain({
-      chainKey: "hyperevm",
-      provider: hyperevmProvider,
-      contract: hyperevmContract,
-      lastBlockRef: lastHyperBlockRef,
-      setLastBlockRef: (v) => (lastHyperBlock = v),
-      maxRange: MAX_BLOCKS_PER_QUERY_HYPER,
-    });
-  }, 9000);
-
-  // run once immediately
-  pollChain({
-    chainKey: "base",
-    provider: baseProvider,
-    contract: baseContract,
-    lastBlockRef: lastBaseBlockRef,
-    setLastBlockRef: (v) => (lastBaseBlock = v),
-    maxRange: MAX_BLOCKS_PER_QUERY_BASE,
-  });
-
-  pollChain({
-    chainKey: "hyperevm",
-    provider: hyperevmProvider,
-    contract: hyperevmContract,
-    lastBlockRef: lastHyperBlockRef,
-    setLastBlockRef: (v) => (lastHyperBlock = v),
-    maxRange: MAX_BLOCKS_PER_QUERY_HYPER,
-  });
-}
-
-// ------------------------
-// Aggregation logic (FID)
-// ------------------------
-// This is the key: combine multiple wallets into one “player” row by fid.
-// If fid is missing, we treat the address as its own player.
-
-function sumStrikesForAddresses(chainMap, addresses) {
-  let total = 0;
-  for (const a of addresses) {
-    const row = chainMap.get(String(a).toLowerCase());
-    if (row?.txCount) total += row.txCount;
-  }
-  return total;
-}
-
-function buildLeaderboard(chainKey) {
-  const chainMap = chainKey === "base" ? playerStats.base : playerStats.hyperevm;
-
-  // Group: fid -> { profile, addresses[], txCount }
-  // Also keep “address-only” entries where fid is null.
-  const fidGroups = new Map();
-  const addressOnly = [];
-
-  for (const [address, data] of chainMap.entries()) {
-    const profile = data.profile || fallbackProfileForAddress(address);
-    const fid = profile?.fid ?? null;
-
-    if (!fid) {
-      addressOnly.push({
-        address,
-        username: profile.username,
-        pfpUrl: profile.pfpUrl,
-        txCount: data.txCount || 0,
-        fid: null,
+      const r = byFid.get(fid);
+      r.txCount += row.txCount;
+      r.walletCount += 1; // number of strike-wallets that contributed
+    } else {
+      // Keep unlinked wallets as separate rows
+      anon.push({
+        address: row.address,
+        txCount: row.txCount,
       });
-      continue;
     }
-
-    const existing = fidGroups.get(fid) || {
-      fid,
-      profile,
-      addresses: new Set(),
-      txCount: 0,
-    };
-
-    existing.addresses.add(address);
-    fidGroups.set(fid, existing);
   }
 
-  // Now expand each fid group to include custody + verifications from Neynar (if present)
-  const merged = [];
-  for (const g of fidGroups.values()) {
-    const p = g.profile || {};
-    const addrs = new Set(g.addresses);
+  const merged = [...byFid.values(), ...anon];
+  merged.sort((a, b) => b.txCount - a.txCount);
 
-    if (p.custodyAddress) addrs.add(p.custodyAddress);
-    for (const v of p.verifications || []) addrs.add(v);
-
-    const allAddresses = Array.from(addrs);
-    const total = sumStrikesForAddresses(chainMap, allAddresses);
-
-    merged.push({
-      fid: g.fid,
-      address: p.custodyAddress || allAddresses[0], // display anchor
-      username: p.username || `fid_${g.fid}`,
-      pfpUrl: p.pfpUrl || `https://api.dicebear.com/7.x/avataaars/svg?seed=${g.fid}`,
-      txCount: total,
-      displayName: p.displayName || null,
-      warpcastUrl: p.warpcastUrl || null,
-    });
-  }
-
-  // Combine fid merged + addressOnly, sort, rank
-  const combined = [...merged, ...addressOnly]
-    .sort((a, b) => (b.txCount || 0) - (a.txCount || 0))
-    .slice(0, 50)
-    .map((row, idx) => ({ ...row, rank: idx + 1 }));
-
-  return combined;
+  // Rank
+  return merged.slice(0, 50).map((r, i) => ({ ...r, rank: i + 1 }));
 }
 
-// ------------------------
-// Routes
-// ------------------------
-
-app.get("/api/leaderboard/:chain", (req, res) => {
-  const chain = String(req.params.chain || "").toLowerCase();
-  if (chain !== "base" && chain !== "hyperevm") return res.status(400).json({ error: "bad chain" });
-  return res.json(buildLeaderboard(chain));
-});
-
+// --- Profile counts ---
+// By address (single wallet)
 app.get("/api/profile/:address", async (req, res) => {
-  const address = String(req.params.address || "").toLowerCase();
+  try {
+    const addr = String(req.params.address || "").toLowerCase();
+    const base = txCounts.base.get(addr) || 0;
+    const hyp = txCounts.hyperevm.get(addr) || 0;
 
-  const baseRow = playerStats.base.get(address);
-  const hyperRow = playerStats.hyperevm.get(address);
+    let identity = null;
+    if (NEYNAR_API_KEY) {
+      try {
+        const map = await resolveAddressesToIdentity([addr]);
+        identity = map.get(addr) || null;
+      } catch {}
+    }
 
-  const profile =
-    baseRow?.profile ||
-    hyperRow?.profile ||
-    (await fetchUsersByAddress(address)) ||
-    fallbackProfileForAddress(address);
-
-  res.json({
-    ...profile,
-    txCount: {
-      base: baseRow?.txCount || 0,
-      hyperevm: hyperRow?.txCount || 0,
-    },
-  });
+    res.json({
+      address: addr,
+      txCount: { base, hyperevm: hyp },
+      identity,
+    });
+  } catch (e) {
+    res.status(500).json({ error: "profile_failed" });
+  }
 });
 
-// ✅ NEW: Always fetch “real Farcaster profile” by fid (fixes Farcaster-wallet identity)
-app.get("/api/farcaster/user/:fid", async (req, res) => {
-  const fid = Number(req.params.fid);
-  if (!fid || Number.isNaN(fid)) return res.status(400).json({ error: "bad fid" });
+// By fid (merge ALL wallets known on Farcaster into one score)
+app.get("/api/profile/by-fid/:fid", async (req, res) => {
+  try {
+    const fid = Number(req.params.fid);
+    if (!fid) return res.status(400).json({ error: "bad_fid" });
 
-  const user = (await fetchUserByFid(fid)) || null;
-  if (!user) return res.status(404).json({ error: "not found" });
+    const user = await getUserByFid(fid);
+    const ident = userToIdentity(user);
 
-  return res.json(user);
+    if (!ident) return res.json({ fid, identity: null, txCount: { base: 0, hyperevm: 0 } });
+
+    let base = 0;
+    let hyp = 0;
+
+    for (const w of ident.wallets) {
+      base += txCounts.base.get(w) || 0;
+      hyp += txCounts.hyperevm.get(w) || 0;
+    }
+
+    res.json({
+      fid,
+      identity: ident,
+      txCount: { base, hyperevm: hyp },
+      walletCount: ident.wallets.length,
+    });
+  } catch {
+    res.status(500).json({ error: "profile_by_fid_failed" });
+  }
 });
 
-app.get("/health", async (req, res) => {
-  // helpful diagnostics
-  let baseHead = null;
-  let hyperHead = null;
+// Leaderboards (merged by Farcaster user where possible)
+app.get("/api/leaderboard/:chain", async (req, res) => {
   try {
-    baseHead = await baseProvider.getBlockNumber();
-  } catch {}
-  try {
-    hyperHead = await hyperevmProvider.getBlockNumber();
-  } catch {}
+    const chain = String(req.params.chain || "");
+    if (!["base", "hyperevm"].includes(chain)) return res.status(404).json({ error: "bad_chain" });
+    const rows = await buildLeaderboard(chain);
+    res.json(rows);
+  } catch {
+    res.status(500).json({ error: "leaderboard_failed" });
+  }
+});
 
+// Health
+app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     port: PORT,
-    baseContract: BASE_CONTRACT,
-    hyperevmContract: HYPEREVM_CONTRACT,
-    base: {
-      last: lastBaseBlockRef.value,
-      head: baseHead,
-      ok: true,
-    },
-    hyperevm: {
-      last: lastHyperBlockRef.value,
-      head: hyperHead,
-      ok: true,
-    },
-    basePlayers: playerStats.base.size,
-    hyperevmPlayers: playerStats.hyperevm.size,
+    baseContract: contracts.base,
+    hyperevmContract: contracts.hyperevm,
+    base: poll.base,
+    hyperevm: poll.hyperevm,
+    basePlayers: txCounts.base.size,
+    hyperevmPlayers: txCounts.hyperevm.size,
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`ChainWarZ Backend listening on ${PORT}`);
+// --- Poller ---
+// HyperEVM public RPC is rate-limited; keep requests low by scanning small windows + slower interval. :contentReference[oaicite:5]{index=5}
+async function startPoller(chainKey, { intervalMs, maxStep }) {
+  const provider = providers[chainKey];
+  const contract = contracts[chainKey];
+
+  // Init last block
+  const head = await provider.getBlockNumber();
+  poll[chainKey].head = head;
+  poll[chainKey].last = Math.max(0, head - 2000);
+  poll[chainKey].ok = true;
+  poll[chainKey].lastError = "";
+  poll[chainKey].lastScan = `init:${poll[chainKey].last}-${head}`;
+
+  // Single-flight loop (no overlap)
+  (async function loop() {
+    while (true) {
+      try {
+        const headNow = await provider.getBlockNumber();
+        poll[chainKey].head = headNow;
+
+        let fromBlock = poll[chainKey].last + 1;
+        if (fromBlock < 0) fromBlock = 0;
+
+        // Scan in small chunks to avoid "invalid block range" / "max block range" errors
+        const toBlock = Math.min(headNow, fromBlock + maxStep);
+
+        // If already caught up, idle
+        if (fromBlock > headNow) {
+          poll[chainKey].ok = true;
+          poll[chainKey].lastError = "";
+          poll[chainKey].lastScan = `caught_up:${headNow}`;
+          await sleep(intervalMs);
+          continue;
+        }
+
+        const logs = await provider.getLogs({
+          address: contract,
+          fromBlock,
+          toBlock,
+          topics: [STRIKE_TOPIC],
+        });
+
+        for (const log of logs) {
+          if (!log?.topics?.[1]) continue;
+          const striker = parseIndexedAddress(log.topics[1]);
+          incCount(chainKey, striker);
+        }
+
+        poll[chainKey].last = toBlock;
+        poll[chainKey].ok = true;
+        poll[chainKey].lastError = "";
+        poll[chainKey].lastScan = `${fromBlock}-${toBlock} logs=${logs.length}`;
+      } catch (e) {
+        const msg = String(e?.message || e || "");
+        poll[chainKey].ok = false;
+        poll[chainKey].lastError = msg.slice(0, 300);
+
+        // Backoff harder on rate limit
+        if (msg.toLowerCase().includes("rate limit") || msg.includes("32005")) {
+          await sleep(Math.max(intervalMs, 20000));
+          continue;
+        }
+      }
+
+      await sleep(intervalMs);
+    }
+  })();
+}
+
+app.listen(PORT, async () => {
+  console.log(`ChainWarZ backend listening on ${PORT}`);
   console.log(`Base RPC: ${BASE_RPC}`);
   console.log(`HyperEVM RPC: ${HYPEREVM_RPC}`);
-  console.log(`Base contract: ${BASE_CONTRACT}`);
-  console.log(`HyperEVM contract: ${HYPEREVM_CONTRACT}`);
-  startPolling();
+  console.log(`Base contract: ${contracts.base}`);
+  console.log(`HyperEVM contract: ${contracts.hyperevm}`);
+
+  // Base can poll faster, HyperEVM slower to avoid RPC rate limit
+  await startPoller("base", { intervalMs: 6000, maxStep: 800 });
+  await startPoller("hyperevm", { intervalMs: 14000, maxStep: 400 });
 });
