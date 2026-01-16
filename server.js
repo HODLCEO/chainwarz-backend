@@ -6,15 +6,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Hard kill-proofing (prevents container exit on random async errors)
-process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED REJECTION:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT EXCEPTION:", err);
-});
+// Hard kill-proofing
+process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
-// --- Config
+// Config
 const PORT = Number(process.env.PORT || 8080);
 
 const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
@@ -28,7 +24,7 @@ const HYPEREVM_CONTRACT =
 
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY || "";
 
-// --- Providers (recreate on failure)
+// Providers
 let baseProvider = new ethers.JsonRpcProvider(BASE_RPC);
 let hyperProvider = new ethers.JsonRpcProvider(HYPEREVM_RPC);
 
@@ -37,8 +33,8 @@ const STRIKE_TOPIC0 = ethers.id("Strike(address,uint256,uint256)");
 
 // In-memory stats
 const stats = {
-  base: new Map(),     // addr -> { txCount, profile }
-  hyperevm: new Map(), // addr -> { txCount, profile }
+  base: new Map(),
+  hyperevm: new Map(),
 };
 
 function fallbackProfile(addr) {
@@ -108,16 +104,39 @@ function resetProvider(chain) {
   else hyperProvider = new ethers.JsonRpcProvider(HYPEREVM_RPC);
 }
 
-// Poll settings (HyperEVM: small chunks to avoid invalid range)
+// Poll settings
 const POLL = {
-  base: { address: BASE_CONTRACT, chunk: 2000, lookback: 8000, interval: 5000 },
-  hyperevm: { address: HYPEREVM_CONTRACT, chunk: 400, lookback: 20000, interval: 9000 },
+  base: {
+    address: BASE_CONTRACT,
+    chunk: 2000,
+    lookback: 8000,
+    interval: 5000,
+  },
+  hyperevm: {
+    address: HYPEREVM_CONTRACT,
+    // ✅ smaller chunk helps avoid rate limits
+    chunk: 100,
+    lookback: 20000,
+    // ✅ slower polling to reduce RPC pressure
+    interval: 30000,
+  },
 };
 
 const cursor = {
-  base: { last: 0, head: 0, ok: true, lastError: "", lastScan: "" },
-  hyperevm: { last: 0, head: 0, ok: true, lastError: "", lastScan: "" },
+  base: { last: 0, head: 0, ok: true, lastError: "", lastScan: "", cooldownUntil: 0 },
+  hyperevm: { last: 0, head: 0, ok: true, lastError: "", lastScan: "", cooldownUntil: 0 },
 };
+
+function nowMs() {
+  return Date.now();
+}
+
+function bump(chain, addr) {
+  const a = addr.toLowerCase();
+  const row = stats[chain].get(a) || { txCount: 0, profile: null };
+  row.txCount += 1;
+  stats[chain].set(a, row);
+}
 
 async function safeGetBlockNumber(chain) {
   try {
@@ -128,6 +147,11 @@ async function safeGetBlockNumber(chain) {
     resetProvider(chain);
     return null;
   }
+}
+
+function isRateLimitError(msg) {
+  const m = String(msg || "").toLowerCase();
+  return m.includes("rate limit") || m.includes("rate limited") || m.includes("too many requests") || m.includes("429");
 }
 
 async function safeGetLogs(chain, fromBlock, toBlock) {
@@ -145,22 +169,28 @@ async function safeGetLogs(chain, fromBlock, toBlock) {
     cursor[chain].lastError = "";
     return logs || [];
   } catch (e) {
-    cursor[chain].ok = false;
-    cursor[chain].lastError = `getLogs failed: ${e?.message || e}`;
-    resetProvider(chain);
-    return null; // signal failure
-  }
-}
+    const msg = e?.message || e;
 
-function bump(chain, addr) {
-  const a = addr.toLowerCase();
-  const row = stats[chain].get(a) || { txCount: 0, profile: null };
-  row.txCount += 1;
-  stats[chain].set(a, row);
+    cursor[chain].ok = false;
+    cursor[chain].lastError = `getLogs failed: ${msg}`;
+
+    // ✅ if rate limited, back off HARD
+    if (isRateLimitError(msg)) {
+      const backoffMs = chain === "hyperevm" ? 120000 : 30000; // 2 minutes on HyperEVM
+      cursor[chain].cooldownUntil = nowMs() + backoffMs;
+      console.warn(`[${chain}] rate limited -> cooling down for ${Math.round(backoffMs / 1000)}s`);
+    }
+
+    resetProvider(chain);
+    return null;
+  }
 }
 
 async function pollOnce(chain) {
   const cfg = POLL[chain];
+
+  // ✅ cooldown check
+  if (cursor[chain].cooldownUntil && nowMs() < cursor[chain].cooldownUntil) return;
 
   const head = await safeGetBlockNumber(chain);
   if (head === null) return;
@@ -173,18 +203,16 @@ async function pollOnce(chain) {
     return;
   }
 
-  if (cursor[chain].last > head) {
-    cursor[chain].last = Math.max(0, head - 1);
-  }
+  if (cursor[chain].last > head) cursor[chain].last = Math.max(0, head - 1);
 
   const from = cursor[chain].last + 1;
   if (from > head) return;
 
   const to = Math.min(head, from + cfg.chunk);
-  const logs = await safeGetLogs(chain, from, to);
 
+  const logs = await safeGetLogs(chain, from, to);
   if (logs === null) {
-    // IMPORTANT: do NOT advance cursor on failure
+    // do not advance cursor on failure
     return;
   }
 
@@ -192,11 +220,9 @@ async function pollOnce(chain) {
     const topic1 = log.topics?.[1];
     if (!topic1) continue;
 
-    // indexed address is last 20 bytes of topic1
     const addr = "0x" + topic1.slice(26);
     bump(chain, addr);
 
-    // hydrate profile once
     const row = stats[chain].get(addr.toLowerCase());
     if (row && !row.profile) {
       row.profile = await fetchProfileByAddress(addr.toLowerCase());
@@ -212,6 +238,7 @@ async function pollOnce(chain) {
 function startPolling() {
   setInterval(() => pollOnce("base"), POLL.base.interval);
   setInterval(() => pollOnce("hyperevm"), POLL.hyperevm.interval);
+
   pollOnce("base");
   pollOnce("hyperevm");
 }
